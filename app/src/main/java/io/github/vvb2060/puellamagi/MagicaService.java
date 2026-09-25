@@ -1,4 +1,4 @@
-﻿package io.github.vvb2060.puellamagi;
+package io.github.vvb2060.puellamagi;
 
 import static io.github.vvb2060.puellamagi.App.TAG;
 

@@ -1,4 +1,4 @@
-﻿#include <jni.h>
+#include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
