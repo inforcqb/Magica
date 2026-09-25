@@ -1,4 +1,4 @@
-#include <jni.h>
+﻿#include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -60,33 +60,49 @@ static void resetprop(const char *name, const char *value) {
     }
 }
 
-/* Make adbd run as root, then fall back to repairing it.
+/* Upstream's adb-root flow, plus one added line.
  *
- * The requested recipe first: /proc/sys/fs/suid_dumpable <- 0 (adbd is said to read
- * that as "this is a debug build"), together with ro.debuggable=1 / ro.secure=0 and a
- * restart of adbd.  If the new adbd really is root, we are done and the two props are
- * put back.
+ * The added line is the requested
+ *     echo 0 > /proc/sys/fs/suid_dumpable
+ * (written directly here, the value and errno are logged) on the theory that adbd
+ * treats that sysctl as "this is a debug build" and then keeps root.
  *
- * If it is not, the fallback matters, because this handset is a user/release build
- * where adbd is compiled with ALLOW_ADBD_ROOT=0 and the root request is answered with
- * "adbd cannot run as root in production builds" *even when ro.debuggable is already
- * 1*.  In that case we clear service.adb.root, restore the props and restart adbd
- * until it is running as shell again -- otherwise adb is left dead (USB debugging
- * shows enabled in Settings while nothing listens on the socket).
+ * Kept from upstream: the su:s0 pre-check, resetprop("ro.debuggable","1"),
+ * resetprop("ro.secure","0"), the bundled __system_property_set("ctl.restart"), and
+ * restoring the two props once adbd is root.
  *
- * Everything is logged, and the waits are bounded (upstream's loop had no exit
- * condition at all, which is what froze the UI).
+ * Two deliberate deviations, both because of what was measured on this handset:
+ *   - /system/bin/setprop ctl.restart adbd is issued as well: the bundled client's
+ *     ctl write was observed to have no effect (adbd kept its pid, the adb shell
+ *     never dropped), while the platform client definitely reaches init;
+ *   - the wait is bounded (15 s).  Upstream's loop had no exit condition at all, and
+ *     with MainActivity calling this on the UI thread that is what froze the app.
+ *
+ * service.adb.root is never set here: on a build whose adbd cannot run as root it
+ * makes adbd exit on start, init restart-loops it, and adb is then dead while
+ * Settings still shows USB debugging as enabled.
  */
 static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
     char old_pid[32] = {};
     char pid[32] = {};
     char path[32] = {};
     struct stat st{};
+    char selinux_context[64] = {};
 
     __system_properties_init();
     __system_property_get("init.svc_debug_pid.adbd", old_pid);
-    LOGI("adb root: start (adbd pid was '%s')", old_pid);
+    if (old_pid[0] == '\0') {
+        LOGW("adb root: adbd is not running (init.svc_debug_pid.adbd empty)");
+    } else {
+        snprintf(path, sizeof(path), "/proc/%s", old_pid);
+        getxattr(path, "security.selinux", selinux_context, sizeof(selinux_context));
+        LOGI("adb root: adbd pid=%s selinux=%s", old_pid, selinux_context);
+        if (strncmp(selinux_context, "u:r:su:s0", strlen("u:r:su:s0")) == 0) {
+            return true;
+        }
+    }
 
+    /* the added line */
     {
         const int fd = open("/proc/sys/fs/suid_dumpable", O_WRONLY);
         if (fd < 0) {
@@ -94,71 +110,46 @@ static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
                  strerror(errno));
         } else {
             const ssize_t w = write(fd, "0\n", 2);
-            LOGI("adb root: suid_dumpable <- 0 (%zd, errno=%d)", w, errno);
+            LOGI("adb root: suid_dumpable <- 0 (wrote %zd, errno=%d)", w, errno);
             close(fd);
         }
     }
+
     resetprop("ro.debuggable", "1");
     resetprop("ro.secure", "0");
+    __system_property_set("ctl.restart", "adbd");
     system("/system/bin/setprop ctl.restart adbd");
 
-    // Bounded wait for an adbd that is actually root.
     struct timespec t0{}, now{};
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    long waited_ms = 0;
     while (true) {
         clock_gettime(CLOCK_MONOTONIC, &now);
-        waited_ms = (now.tv_sec - t0.tv_sec) * 1000L +
-                    (now.tv_nsec - t0.tv_nsec) / 1000000L;
-        if (waited_ms > 15000) break;
-        __system_property_get("init.svc_debug_pid.adbd", pid);
-        if (pid[0] == '\0' || strcmp(pid, old_pid) == 0) { usleep(10000); continue; }
-        snprintf(path, sizeof(path), "/proc/%s", pid);
-        if (stat(path, &st) != 0) { usleep(10000); continue; }
-        if (st.st_uid == 0) {
-            LOGI("adb root: adbd is running as ROOT (pid=%s)", pid);
-            resetprop("ro.debuggable", "0");
-            resetprop("ro.secure", "1");
-            return true;
-        }
-        if (st.st_uid == AID_SHELL) {
-            LOGW("adb root: adbd came back as shell (pid=%s) -- falling back to repair", pid);
-            break;
-        }
-        usleep(10000);
-    }
-    LOGW("adb root: no root adbd after %ld ms; repairing adb instead", waited_ms);
-
-    resetprop("ro.debuggable", "0");
-    resetprop("ro.secure", "1");
-    system("/system/bin/setprop service.adb.root 0");
-    system("/system/bin/setprop ctl.restart adbd");
-
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    while (true) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long waited = (now.tv_sec - t0.tv_sec) * 1000L +
-                      (now.tv_nsec - t0.tv_nsec) / 1000000L;
-        if (waited > 15000) {
-            LOGW("repair adbd: gave up after %ld ms (adbd pid still '%s')",
-                 waited, pid);
+        const long waited_ms = (now.tv_sec - t0.tv_sec) * 1000L +
+                               (now.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (waited_ms > 15000) {
+            LOGW("adb root: gave up after %ld ms (adbd pid=%s, ro.debuggable=1 left "
+                 "in place)", waited_ms, pid);
             return false;
         }
         __system_property_get("init.svc_debug_pid.adbd", pid);
-        if (pid[0] == '\0') {           // not even started yet
-            usleep(10000);
-            continue;
-        }
+        if (pid[0] == '\0' || strcmp(pid, old_pid) == 0) { usleep(10000); continue; }
         snprintf(path, sizeof(path), "/proc/%s", pid);
-        if (stat(path, &st) != 0) {     // it died again; wait for the next one
-            usleep(10000);
-            continue;
-        }
+        getxattr(path, "security.selinux", selinux_context, sizeof(selinux_context));
+        if (stat(path, &st) != 0) { usleep(10000); continue; }
+        LOGI("adb root: new adbd pid=%s uid=%d selinux=%s", pid, (int) st.st_uid,
+             selinux_context);
         if (st.st_uid == AID_SHELL) {
-            LOGI("repair adbd: running as shell again (pid=%s)", pid);
+            LOGW("adb root: adbd dropped privileges (uid=%d) -- no root adbd on this "
+                 "build", (int) st.st_uid);
+            return false;
+        } else if (strncmp(selinux_context, "u:r:su:s0", strlen("u:r:su:s0")) == 0) {
+            LOGI("adb root: adbd running as root (selinux=%s)", selinux_context);
+            resetprop("ro.debuggable", "0");
+            resetprop("ro.secure", "1");
             return true;
+        } else {
+            usleep(10000);
         }
-        usleep(10000);
     }
 }
 
