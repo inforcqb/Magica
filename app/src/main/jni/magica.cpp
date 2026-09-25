@@ -1,10 +1,19 @@
 #include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pty.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <linux/capability.h>
 #include <lsplt.hpp>
 #include <api/system_properties.h>
@@ -165,6 +174,208 @@ static void signal_handler(int sig) {
     LOGW("received signal: SIGSYS, setresuid fail");
 }
 
+/* ---- root shell server ----------------------------------------------------
+ *
+ * Exposes the uid-0 shell this service already owns to anything that can reach
+ * loopback, so `adb shell` (uid 2000, no root) can open a real root shell without
+ * any kernel write -- which matters on this handset, where the OPPO guard module
+ * intercepts credential writes but has never objected to anything Magica does
+ * (its root is a userspace one).
+ *
+ *   adb shell 'T=$(cat /data/local/tmp/gl-w1/rshell.token); { echo "$T"; cat; } | nc 127.0.0.1 1337'
+ *
+ * The server daemonises (double fork + setsid) so it keeps running after the app
+ * is gone, and requires the token as the first line so other apps on the phone
+ * cannot just connect.  Caveat: the token file is world-readable (0644) because a
+ * capless uid-0 process cannot chown a socket; treat it as a prototype-grade
+ * secret.
+ */
+#define RSH_PORT 1337
+#define RSH_TOKEN_PATH "/data/local/tmp/gl-w1/rshell.token"
+
+static void rsh_log(const char *format, ...) {
+    const int fd = open("/data/local/tmp/gl-w1/rshell.log",
+                        O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, format);
+    const int n = vsnprintf(buf, sizeof(buf), format, ap);
+    va_end(ap);
+    if (n > 0) (void) !write(fd, buf, (size_t) n);
+    close(fd);
+}
+
+static void rsh_make_token(char *out, size_t cap) {
+    const int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    unsigned char raw[16] = {};
+    if (fd >= 0) {
+        (void) !read(fd, raw, sizeof(raw));
+        close(fd);
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < sizeof(raw) && n + 3 < cap; i++) {
+        n += (size_t) snprintf(out + n, cap - n, "%02x", raw[i]);
+    }
+    out[n] = '\0';
+}
+
+/* Borrow the token from the app's own data dir if it exists there, else keep ours. */
+static void rsh_read_expected(const char *fallback, char *out, size_t cap) {
+    const int fd = open(RSH_TOKEN_PATH, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        snprintf(out, cap, "%s", fallback);
+        return;
+    }
+    const ssize_t r = read(fd, out, cap - 1);
+    close(fd);
+    if (r <= 0) {
+        snprintf(out, cap, "%s", fallback);
+        return;
+    }
+    out[r] = '\0';
+    char *nl = strchr(out, '\n');
+    if (nl) *nl = '\0';
+}
+
+static void rsh_pump(int cfd, int master) {
+    char buf[4096];
+    for (;;) {
+        struct pollfd fds[2] = {{cfd, POLLIN, 0}, {master, POLLIN, 0}};
+        if (poll(fds, 2, -1) <= 0) return;
+        for (int i = 0; i < 2; i++) {
+            if (!(fds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+            const int from = fds[i].fd;
+            const int to = i == 0 ? master : cfd;
+            const ssize_t n = read(from, buf, sizeof(buf));
+            if (n <= 0) return;
+            ssize_t off = 0;
+            while (off < n) {
+                const ssize_t w = write(to, buf + off, (size_t) (n - off));
+                if (w <= 0) return;
+                off += w;
+            }
+        }
+    }
+}
+
+static void rsh_serve_client(int cfd, const char *expected) {
+    char line[128] = {};
+    size_t n = 0;
+    while (n + 1 < sizeof(line)) {
+        const ssize_t r = read(cfd, line + n, 1);
+        if (r <= 0) { close(cfd); return; }
+        if (line[n] == '\n') break;
+        n++;
+    }
+    line[n] = '\0';
+    if (strcmp(line, expected) != 0) {
+        rsh_log("reject: bad token\n");
+        (void) !write(cfd, "bad token\n", 10);
+        close(cfd);
+        return;
+    }
+    int master = -1;
+    const pid_t pid = forkpty(&master, nullptr, nullptr, nullptr);
+    if (pid < 0) {
+        rsh_log("forkpty failed: %s\n", strerror(errno));
+        close(cfd);
+        return;
+    }
+    if (pid == 0) {
+        setenv("HOME", "/data/local/tmp/gl-w1", 1);
+        setenv("TERM", "xterm", 1);
+        execl("/system/bin/sh", "sh", "-i", (char *) nullptr);
+        _exit(127);
+    }
+    rsh_log("client ok, sh pid=%d\n", (int) pid);
+    rsh_pump(cfd, master);
+    kill(pid, SIGHUP);
+    close(master);
+    close(cfd);
+}
+
+static void rsh_loop(int listen_fd, const char *expected) {
+    for (;;) {
+        const int cfd = accept(listen_fd, nullptr, nullptr);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        const pid_t c = fork();
+        if (c == 0) {
+            close(listen_fd);
+            rsh_serve_client(cfd, expected);
+            _exit(0);
+        }
+        close(cfd);
+        if (c < 0) continue;
+        (void) waitpid(c, nullptr, WNOHANG);
+    }
+}
+
+static jboolean start_shell_server(JNIEnv *env  __unused, jclass clazz  __unused) {
+    if (geteuid() != AID_ROOT) {
+        LOGW("shell server: not root yet");
+        return false;
+    }
+    char token[64] = {};
+    rsh_make_token(token, sizeof(token));
+
+    /* Keep the token only if the caller pre-created it; otherwise publish ours. */
+    const int tfd = open(RSH_TOKEN_PATH, O_RDONLY | O_CLOEXEC);
+    if (tfd >= 0) {
+        close(tfd);
+    } else {
+        const int wfd = open(RSH_TOKEN_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (wfd >= 0) {
+            (void) !write(wfd, token, strlen(token));
+            (void) !write(wfd, "\n", 1);
+            close(wfd);
+        }
+    }
+    char expected[64] = {};
+    rsh_read_expected(token, expected, sizeof(expected));
+
+    const int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0) return false;
+    const int one = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(RSH_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(lfd, (struct sockaddr *) &addr, sizeof(addr)) != 0 || listen(lfd, 8) != 0) {
+        rsh_log("bind/listen 127.0.0.1:%d failed: %s\n", RSH_PORT, strerror(errno));
+        close(lfd);
+        return false;
+    }
+
+    /* Daemonise so the shell survives this process/app. */
+    const pid_t mid = fork();
+    if (mid < 0) return false;
+    if (mid > 0) {
+        (void) waitpid(mid, nullptr, 0);
+        return true;
+    }
+    (void) setsid();
+    const pid_t d = fork();
+    if (d < 0) _exit(1);
+    if (d > 0) _exit(0);
+    (void) chdir("/");
+    const int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        (void) dup2(devnull, 0);
+        (void) dup2(devnull, 1);
+        (void) dup2(devnull, 2);
+        if (devnull > 2) close(devnull);
+    }
+    rsh_log("listening on 127.0.0.1:%d (token %s)\n", RSH_PORT,
+            RSH_TOKEN_PATH);
+    rsh_loop(lfd, expected);
+    _exit(0);
+}
+
 jint JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNIEnv *env;
     jclass clazz;
@@ -180,6 +391,7 @@ jint JNI_OnLoad(JavaVM *jvm, void *v __unused) {
     JNINativeMethod methods[] = {
             {"root",     "()Z", (void *) root},
             {"adb_root", "()Z", (void *) adb_root},
+            {"start_shell_server", "()Z", (void *) start_shell_server},
     };
     if (env->RegisterNatives(clazz, methods, arraysize(methods)) < 0) {
         return JNI_ERR;
