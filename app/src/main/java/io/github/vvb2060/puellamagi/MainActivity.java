@@ -83,18 +83,20 @@ public final class MainActivity extends Activity {
         }
 
         // This build needs nothing else: the module is unloaded and that is all.
-        // killMagiskd()/installMagisk() are left in place but not entered -- drop
-        // this return to get the upstream Magisk flow back.
-        return;
-
-        var cmd = "ps -A 2>/dev/null | grep magiskd | grep -qv grep";
-        var magiskd = ShellUtils.fastCmdResult(shell, cmd);
-        if (magiskd) {
-            console.add(getString(R.string.magiskd_running));
-            killMagiskd();
-        } else {
-            console.add(getString(R.string.magiskd_not_running));
-            installMagisk();
+        // The upstream Magisk flow is kept but not entered -- javac rejects code
+        // after an unconditional return ("unreachable statement"), and `if (false)`
+        // is the one form it explicitly allows (JLS 14.21).  Flip it to true to get
+        // killMagiskd()/installMagisk() back.
+        if (false) {
+            var cmd = "ps -A 2>/dev/null | grep magiskd | grep -qv grep";
+            var magiskd = ShellUtils.fastCmdResult(shell, cmd);
+            if (magiskd) {
+                console.add(getString(R.string.magiskd_running));
+                killMagiskd();
+            } else {
+                console.add(getString(R.string.magiskd_not_running));
+                installMagisk();
+            }
         }
     }
 
