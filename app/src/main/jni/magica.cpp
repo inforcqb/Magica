@@ -1,4 +1,4 @@
-#include <jni.h>
+﻿#include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <linux/capability.h>
 #include <lsplt.hpp>
@@ -190,7 +191,7 @@ static void signal_handler(int sig) {
  * capless uid-0 process cannot chown a socket; treat it as a prototype-grade
  * secret.
  */
-#define RSH_PORT 1337
+#define RSH_SOCK_PATH "/data/local/tmp/gl-w1/rshell.sock"
 #define RSH_TOKEN_PATH "/data/local/tmp/gl-w1/rshell.token"
 
 static void rsh_log(const char *format, ...) {
@@ -336,24 +337,39 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jclass clazz  __unused
     }
     char expected[64] = {};
     rsh_read_expected(token, expected, sizeof(expected));
+    /* uid 0 is the owner, so this works without CAP_CHOWN; adb shell (uid 2000)
+     * can then read the token even though the writer was root. */
+    chmod(RSH_TOKEN_PATH, 0644);
 
-    const int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (lfd < 0) return false;
-    const int one = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    struct sockaddr_in addr = {};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(RSH_PORT);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(lfd, (struct sockaddr *) &addr, sizeof(addr)) != 0 || listen(lfd, 8) != 0) {
-        rsh_log("bind/listen 127.0.0.1:%d failed: %s\n", RSH_PORT, strerror(errno));
+    /* AF_UNIX, not AF_INET: this service runs in an isolated process, and Android
+     * blocks IP sockets there (measured: token got written, then socket() returned
+     * -1 and nothing listened while Seccomp showed mode 2 with 3 filters).  Unix
+     * sockets are allowed, and 0666 on the node is enough for adb shell to connect
+     * without any chown. */
+    const int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (lfd < 0) {
+        rsh_log("socket(AF_UNIX) failed: %s\n", strerror(errno));
+        return false;
+    }
+    (void) unlink(RSH_SOCK_PATH);
+    struct sockaddr_un addr = {};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", RSH_SOCK_PATH);
+    if (bind(lfd, (struct sockaddr *) &addr, sizeof(addr)) != 0 ||
+        listen(lfd, 8) != 0) {
+        rsh_log("bind/listen %s failed: %s\n", RSH_SOCK_PATH, strerror(errno));
         close(lfd);
         return false;
     }
+    chmod(RSH_SOCK_PATH, 0666);
+    rsh_log("listening on %s (token %s)\n", RSH_SOCK_PATH, RSH_TOKEN_PATH);
 
     /* Daemonise so the shell survives this process/app. */
     const pid_t mid = fork();
-    if (mid < 0) return false;
+    if (mid < 0) {
+        rsh_log("fork failed: %s\n", strerror(errno));
+        return false;
+    }
     if (mid > 0) {
         (void) waitpid(mid, nullptr, 0);
         return true;
@@ -370,8 +386,7 @@ static jboolean start_shell_server(JNIEnv *env  __unused, jclass clazz  __unused
         (void) dup2(devnull, 2);
         if (devnull > 2) close(devnull);
     }
-    rsh_log("listening on 127.0.0.1:%d (token %s)\n", RSH_PORT,
-            RSH_TOKEN_PATH);
+    rsh_log("daemon up, accepting on %s\n", RSH_SOCK_PATH);
     rsh_loop(lfd, expected);
     _exit(0);
 }
@@ -424,3 +439,4 @@ jint JNI_OnLoad(JavaVM *jvm, void *v __unused) {
 
     return JNI_VERSION_1_6;
 }
+

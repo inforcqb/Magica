@@ -1,4 +1,4 @@
-package io.github.vvb2060.puellamagi;
+﻿package io.github.vvb2060.puellamagi;
 
 import static io.github.vvb2060.puellamagi.App.TAG;
 
@@ -44,7 +44,7 @@ public final class MagicaService extends Service {
             root();
             process = Runtime.getRuntime().exec("sh");
             if (start_shell_server()) {
-                Log.i(TAG, "root shell server: 127.0.0.1:1337 (token /data/local/tmp/gl-w1/rshell.token)");
+                Log.i(TAG, "root shell server: /data/local/tmp/gl-w1/rshell.sock (token rshell.token)");
             } else {
                 Log.w(TAG, "root shell server: not started");
             }
@@ -55,3 +55,4 @@ public final class MagicaService extends Service {
         }
     }
 }
+
