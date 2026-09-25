@@ -1,4 +1,4 @@
-﻿#include <jni.h>
+#include <jni.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
@@ -119,6 +119,13 @@ static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
     resetprop("ro.secure", "0");
     __system_property_set("ctl.restart", "adbd");
     system("/system/bin/setprop ctl.restart adbd");
+
+    // ctl.restart does not fire on this handset: measured twice, with both the
+    // bundled client and /system/bin/setprop, while adbd kept its pid.  Restart it the
+    // way adbd does it for "adb root" itself: kill it and let init respawn the service
+    // (adbd.rc has no oneshot flag).
+    LOGI("adb root: pkill -9 adbd (init respawns it)");
+    system("/system/bin/pkill -9 adbd");
 
     struct timespec t0{}, now{};
     clock_gettime(CLOCK_MONOTONIC, &t0);
