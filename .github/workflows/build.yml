@@ -1,0 +1,49 @@
+name: Android CI
+
+# Replaces the upstream android.yml/main.yml, which used actions/checkout@v2,
+# setup-java@v1 and upload-artifact@v2 -- v2 artifacts are disabled on GitHub, so
+# that workflow can no longer produce anything.  This one builds on ubuntu only,
+# installs the exact build-tools/NDK the project pins, and uploads both APKs.
+#
+#   app/build.gradle: compileSdk 30, buildTools 30.0.3, ndkVersion 22.1.7171670,
+#   ndkBuild via src/main/jni/Android.mk, Gradle 7.0 + AGP 7.0.0-alpha14 => JDK 11.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Install pinned SDK components and NDK
+        run: |
+          set -eux
+          SDKMANAGER="$(command -v sdkmanager || echo "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager")"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install 'platforms;android-30' 'build-tools;30.0.3' 'ndk;22.1.7171670'
+          echo "sdk: $ANDROID_SDK_ROOT"
+          ls "$ANDROID_SDK_ROOT/ndk" || true
+
+      - name: Build debug and release
+        run: |
+          set -eux
+          ./gradlew --no-daemon --stacktrace assembleDebug
+          ./gradlew --no-daemon --stacktrace assembleRelease
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: magica-apks
+          path: app/build/outputs/apk/**/*.apk
+          if-no-files-found: error

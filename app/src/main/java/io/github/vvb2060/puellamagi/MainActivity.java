@@ -71,13 +71,21 @@ public final class MainActivity extends Activity {
     }
 
     void check() {
-        cmd("id");
+        // Was cmd("id") -- the console line that prints uid/gid.  It is replaced
+        // by the one root action this build needs; the root check below does not
+        // depend on it (it uses Shell.isRoot()).
+        cmd("rmmod oplus_security_guard");
         if (shell.isRoot()) {
             console.add(getString(R.string.root_shell_opened));
         } else {
             console.add(getString(R.string.cannot_open_root_shell));
             return;
         }
+
+        // This build needs nothing else: the module is unloaded and that is all.
+        // killMagiskd()/installMagisk() are left in place but not entered -- drop
+        // this return to get the upstream Magisk flow back.
+        return;
 
         var cmd = "ps -A 2>/dev/null | grep magiskd | grep -qv grep";
         var magiskd = ShellUtils.fastCmdResult(shell, cmd);
