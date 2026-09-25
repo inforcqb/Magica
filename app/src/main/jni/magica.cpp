@@ -78,7 +78,17 @@ static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
 
     resetprop("ro.debuggable", "1");
     resetprop("ro.secure", "0");
-    __system_property_set("ctl.restart", "adbd");
+    // Upstream relied on the vendored __system_property_set("ctl.restart", "adbd")
+    // here, and that write was observed to have no effect at all: adbd kept its pid
+    // and the adb shell never dropped.  Two things are needed for a root adbd:
+    //   * service.adb.root=1 -- adbd.rc has "on property:service.adb.root=1 restart
+    //     adbd", which is the trigger that actually restarts it;
+    //   * the write must reach init, so use the platform's own setprop instead of
+    //     the bundled client.
+    system("/system/bin/setprop service.adb.root 1");
+    system("/system/bin/setprop ctl.restart adbd");
+    LOGI("adb root: ro.debuggable=%s service.adb.root=%s adbd pid was %s",
+         __system_property_find("ro.debuggable") ? "1" : "?", "1", old_pid);
 
     // Upstream had no exit condition here at all: if the restarted adbd never
     // reaches u:r:su:s0 (it can crash-loop, or SELinux can refuse the su label)
