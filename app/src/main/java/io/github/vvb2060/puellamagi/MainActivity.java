@@ -71,10 +71,15 @@ public final class MainActivity extends Activity {
     }
 
     void check() {
-        // Was cmd("id") -- the console line that prints uid/gid.  It is replaced
-        // by the one root action this build needs; the root check below does not
-        // depend on it (it uses Shell.isRoot()).
-        cmd("rmmod oplus_security_guard");
+        // Magisk's resetprop, bundled in this APK as
+        // jniLibs/arm64-v8a/libmagiskbin.so.  It is packaged as a JNI lib on
+        // purpose: an APK's native libraries are extracted to
+        // /data/app/.../lib/arm64, which is executable, while app data is not
+        // (that is also why Magisk itself ships its binaries as lib*.so).
+        // As uid 0 resetprop rewrites the property area in place and needs no
+        // capability at all, which is exactly the root this process has.
+        final String bundled = getApplicationInfo().nativeLibraryDir + "/libmagiskbin.so";
+        cmd(bundled + " resetprop ro.debuggable 1", "getprop ro.debuggable");
         if (shell.isRoot()) {
             console.add(getString(R.string.root_shell_opened));
         } else {

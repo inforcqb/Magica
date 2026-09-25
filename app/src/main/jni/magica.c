@@ -49,6 +49,11 @@ static int skip_capset(cap_user_header_t header __unused, cap_user_data_t data _
 }
 
 static void root(JNIEnv *env  __unused, jclass clazz __unused) {
+    /* Diagnostic: what identity does the service process actually start with?
+     * Magica's premise is that the app zygote still arrives as uid 0 but with an
+     * empty capability set; this makes that measurable per run instead of assumed. */
+    LOGI("pre-root: uid=%d euid=%d gid=%d ngroups=%d", (int) getuid(),
+         (int) geteuid(), (int) getgid(), (int) getgroups(0, NULL));
     change_cap(CAP_SET);
     print_cap();
     if (setresuid(AID_ROOT, AID_ROOT, AID_ROOT)) {
