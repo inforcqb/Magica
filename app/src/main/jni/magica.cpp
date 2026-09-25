@@ -1,4 +1,5 @@
 #include <jni.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
@@ -79,7 +80,21 @@ static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
     resetprop("ro.secure", "0");
     __system_property_set("ctl.restart", "adbd");
 
+    // Upstream had no exit condition here at all: if the restarted adbd never
+    // reaches u:r:su:s0 (it can crash-loop, or SELinux can refuse the su label)
+    // this spun forever, and because MainActivity calls it through Binder from the
+    // UI thread the whole app froze ("not responding").  Bound the wait instead.
+    struct timespec t0{}, now{};
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     while (true) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        long waited_ms = (now.tv_sec - t0.tv_sec) * 1000L +
+                         (now.tv_nsec - t0.tv_nsec) / 1000000L;
+        if (waited_ms > 15000) {
+            LOGW("adb root: gave up after %ld ms (adbd never reached u:r:su:s0, "
+                 "pid=%s)", waited_ms, pid);
+            return false;
+        }
         __system_property_get("init.svc_debug_pid.adbd", pid);
         if (strcmp(pid, old_pid) == 0) continue;
         snprintf(path, sizeof(path), "/proc/%s", pid);

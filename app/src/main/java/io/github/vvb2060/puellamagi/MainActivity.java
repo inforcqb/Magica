@@ -108,15 +108,28 @@ public final class MainActivity extends Activity {
         binding.install.setVisibility(View.VISIBLE);
     }
 
+    /* AdbRoot() is a blocking Binder call that waits for adbd to come back as
+     * u:r:su:s0.  Running it on the UI thread is what froze the app ("not
+     * responding") whenever adbd did not cooperate, so it gets its own thread and
+     * only the console updates are posted back. */
     private void adbRoot() {
+        new Thread(this::adbRootBlocking, "adb-root").start();
+    }
+
+    private void adbRootBlocking() {
         try {
-            if (server.adbRoot()) {
-                console.add(getString(R.string.adb_root_enabled));
-            } else {
-                console.add(getString(R.string.adb_root_disabled));
-            }
+            final boolean ok = server.adbRoot();
+            runOnUiThread(() -> {
+                console.add(getString(ok ? R.string.adb_root_enabled
+                                          : R.string.adb_root_disabled));
+                binding.install.setEnabled(true);
+            });
         } catch (RemoteException e) {
-            console.add(Log.getStackTraceString(e));
+            final String trace = Log.getStackTraceString(e);
+            runOnUiThread(() -> {
+                console.add(trace);
+                binding.install.setEnabled(true);
+            });
         }
     }
 
