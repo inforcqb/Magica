@@ -57,43 +57,37 @@ static void resetprop(const char *name, const char *value) {
     }
 }
 
+/* Repair the adb daemon rather than trying to make it root.
+ *
+ * This handset is a user/release build (ro.build.type=user, release-keys), and
+ * adbd is compiled with ALLOW_ADBD_ROOT=0 there.  Consequences, all measured:
+ *   - "adb root" always answers "adbd cannot run as root in production builds",
+ *     even with ro.debuggable=1 already in the property area, so a restart cannot
+ *     change that -- the gate is compile-time, not a property;
+ *   - a *set* service.adb.root makes adbd try to run as root, fail and exit, and
+ *     init restart-loops it: USB debugging then shows as enabled in Settings while
+ *     nothing is listening on the adb socket at all.
+ * So the only useful action here is the reverse: clear that property, restore
+ * ro.debuggable/ro.secure, and restart adbd until it is running as shell again.
+ */
 static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
     char old_pid[32] = {};
     char pid[32] = {};
     char path[32] = {};
     struct stat st{};
-    char selinux_context[64] = {};
 
     __system_properties_init();
     __system_property_get("init.svc_debug_pid.adbd", old_pid);
-    if (old_pid[0] == '\0') {
-        return false;
-    }
-    snprintf(path, sizeof(path), "/proc/%s", old_pid);
-    getxattr(path, "security.selinux", selinux_context, sizeof(selinux_context));
-    LOGV("%s selinux context: %s", path, selinux_context);
-    if (strncmp(selinux_context, "u:r:su:s0", strlen("u:r:su:s0")) == 0) {
-        return true;
-    }
+    LOGI("repair adbd: start (adbd pid was '%s')", old_pid);
 
-    resetprop("ro.debuggable", "1");
-    resetprop("ro.secure", "0");
-    // Upstream relied on the vendored __system_property_set("ctl.restart", "adbd")
-    // here, and that write was observed to have no effect at all: adbd kept its pid
-    // and the adb shell never dropped.  Two things are needed for a root adbd:
-    //   * service.adb.root=1 -- adbd.rc has "on property:service.adb.root=1 restart
-    //     adbd", which is the trigger that actually restarts it;
-    //   * the write must reach init, so use the platform's own setprop instead of
-    //     the bundled client.
-    system("/system/bin/setprop service.adb.root 1");
+    resetprop("ro.debuggable", "0");
+    resetprop("ro.secure", "1");
+    // The platform client, so the message definitely reaches init.
+    system("/system/bin/setprop service.adb.root 0");
     system("/system/bin/setprop ctl.restart adbd");
-    LOGI("adb root: ro.debuggable=%s service.adb.root=%s adbd pid was %s",
-         __system_property_find("ro.debuggable") ? "1" : "?", "1", old_pid);
 
-    // Upstream had no exit condition here at all: if the restarted adbd never
-    // reaches u:r:su:s0 (it can crash-loop, or SELinux can refuse the su label)
-    // this spun forever, and because MainActivity calls it through Binder from the
-    // UI thread the whole app froze ("not responding").  Bound the wait instead.
+    // Bounded wait (upstream had no exit condition at all, which is what froze the
+    // UI when adbd did not cooperate).
     struct timespec t0{}, now{};
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (true) {
@@ -101,27 +95,25 @@ static jboolean adb_root(JNIEnv *env  __unused, jclass clazz __unused) {
         long waited_ms = (now.tv_sec - t0.tv_sec) * 1000L +
                          (now.tv_nsec - t0.tv_nsec) / 1000000L;
         if (waited_ms > 15000) {
-            LOGW("adb root: gave up after %ld ms (adbd never reached u:r:su:s0, "
-                 "pid=%s)", waited_ms, pid);
+            LOGW("repair adbd: gave up after %ld ms (adbd pid still '%s')",
+                 waited_ms, pid);
             return false;
         }
         __system_property_get("init.svc_debug_pid.adbd", pid);
-        if (strcmp(pid, old_pid) == 0) continue;
-        snprintf(path, sizeof(path), "/proc/%s", pid);
-        getxattr(path, "security.selinux", selinux_context, sizeof(selinux_context));
-        stat(path, &st);
-        if (st.st_uid == AID_SHELL) {
-            LOGW("adbd dropped privileges");
-            return false;
-        } else if (strncmp(selinux_context, "u:r:su:s0", strlen("u:r:su:s0")) == 0) {
-            LOGD("adbd running as root");
-            resetprop("ro.debuggable", "0");
-            resetprop("ro.secure", "1");
-            return true;
-        } else {
-            LOGV("adbd initializing");
+        if (pid[0] == '\0') {           // not even started yet
             usleep(10000);
+            continue;
         }
+        snprintf(path, sizeof(path), "/proc/%s", pid);
+        if (stat(path, &st) != 0) {     // it died again; wait for the next one
+            usleep(10000);
+            continue;
+        }
+        if (st.st_uid == AID_SHELL) {
+            LOGI("repair adbd: running as shell again (pid=%s)", pid);
+            return true;
+        }
+        usleep(10000);
     }
 }
 
